@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: rideshare_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: rideshare
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  pgloader:
+    image: dimitri/pgloader:latest
+    container_name: rideshare_migration
+    depends_on:
+      - postgres
+    volumes:
+      - ./rideshare.db:/data/rideshare.db
+    command: >
+      sh -c "
+      echo 'Waiting for Postgres...';
+      sleep 5;
+      pgloader sqlite:///data/rideshare.db postgresql://admin:admin@postgres:5432/rideshare;
+      echo 'Migration completed';
+      "
+
+volumes:
+  pgdata:
