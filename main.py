@@ -5,6 +5,8 @@ import json
 import os 
 from dotenv import load_dotenv
 from mistralai.client import Mistral
+import psycopg2
+from psycopg2.extras import RealDictCursor 
 
 load_dotenv()
 
@@ -12,66 +14,109 @@ api_key = os.getenv("MISTRAL_KEY")
 model = "mistral-small-2506"
 client = Mistral(api_key=api_key)
 temperature = 0.4
-system_prompt = "You are a helpful assistant that answers questions in a concise and accurate manner."
+system_prompt = """
+    You are database assistant that can help users with their PostgreSQL database. You can answer questions about the database schema, and you can also execute SQL queries to get data from the database. 
+    You have access to the following tool:
+    Get always use the tool when the user asks about the database schema or when you need to execute a SQL query to get data from the database. Do not try to answer questions about the database schema without using the tool, as you do not have access to the database schema directly. Always use the tool to get the database schema and then answer the user's question based on the schema you obtained from the tool.
+    - get_pg_schema : Get the PostgreSQL database schema. This tool does not take any arguments and returns a string representation of the database schema.
+
+    Some examples of questions you can answer are:
+    - What is the query for getting all users?
+    - How many orders were placed in the last month?
+    - What are the columns in the users table?
+    - What is the data type of the email column in the users table?
+
+    Aside from the schema you obtain from the database connection, provide an answer.
+"""
 
 
 
-
-'''
-FUNCTION CALL 
-
-'''
-
-def get_weather (location: str) -> str :
-
+def get_pg_schema () -> str :
     '''
-    Get the current weather for a given location using the Open-Meteo Geocoding API.
-    Parameters:
-    - location (str): The name of the location to get the weather for.
+    Get the PostgreSQL database schema as a string.
     Returns:
-    - str: A string containing the current weather information for the specified location.
+    - str: A string representation of the PostgreSQL database schema.
     '''
+
+    connection = psycopg2.connect(
+        user=os.getenv("POSTGRES_USER"),
+        password=os.getenv("POSTGRES_PASSWORD"),
+        host=os.getenv("POSTGRES_HOST"),
+        port=os.getenv("POSTGRES_PORT"),
+        database=os.getenv("POSTGRES_DB")
+    )
+
     
-    with httpx.Client() as client :
-        geo_url = client.get(f"https://geocoding-api.open-meteo.com/v1/search?name={location}&count=1&format=json&language=en&limit=1")
-        geo_data = geo_url.json()
 
-        if not geo_data.get("results") :
-            return f"Sorry, I couldn't find any weather data for {location}."
+    result = {}
+    connection.autocommit = True
 
-        lat, lon = geo_data["results"][0]["latitude"], geo_data["results"][0]["longitude"]
-
-        weather_url = client.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true")
-
-        print(f"\033[1;36m API call: https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true \033[0m")
+    with connection.cursor() as cur :
+        cur.execute("""
+            SELECT datname
+            FROM pg_database
+            WHERE datistemplate = false
+        """)
         
-        weather_data = weather_url.json().get("current_weather", {})
+        databases = [row[0] for row in cur.fetchall()]
+
+    connection.close()
+
+    for db in databases :
+        result[db] = {}
+
+        connection = psycopg2.connect(
+            user=os.getenv("POSTGRES_USER"),
+            password=os.getenv("POSTGRES_PASSWORD"),
+            host=os.getenv("POSTGRES_HOST"),
+            port=os.getenv("POSTGRES_PORT"),
+            database=db
+        )
+
+        with connection.cursor(cursor_factory=RealDictCursor) as cur :
+            cur.execute(f"""
+                    SELECT column_name, data_type, table_schema, table_name
+                    FROM information_schema.columns
+                    WHERE table_name not like 'pg_%' 
+                    AND table_schema <> 'information_schema'
+                """)
+
+            rows = cur.fetchall()
+
+            for r in rows :
+                schema = r["table_schema"]
+                table = r["table_name"]
+                column = r["column_name"]
+                data_type = r["data_type"]
+
+                result[db].setdefault(schema, {})
+                result[db][schema].setdefault(table, [])
+                result[db][schema][table].append(column)
+            
+        connection.close()
+
+    print(f"\033[1;36m Database schema obtained: {result} \033[0m")
+    return result
 
 
-        return f"The current weather in {location} is {weather_data.get('temperature', 'unknown')}°C with a wind speed of {weather_data.get('windspeed', 'unknown')} km/h."
 
 
 
 ## Function list 
 function_list = {
-    'get_weather': get_weather    
+    'get_pg_schema': get_pg_schema    
 }
 
 tools = [
     {
         "type": "function",
         "function": {
-            "name"  : "get_weather",
-            "description" : "Get the current weather for a given location.",
+            "name"  : "get_pg_schema",
+            "description" : "Get the PostgreSQL database schema.",
             "parameters" : {
                 "type" : "object",
-                "properties" : {
-                    "location" : {
-                        "type" : "string",
-                        "description" : "The name of the location to get the weather for."
-                    }
-                },
-                "required" : ["location"]
+                "properties" : {},
+                "required" : []
             }
         }
     }
@@ -111,17 +156,24 @@ class Conversation :
                 function_name = tool_call.function.name
                 function_args = json.loads(tool_call.function.arguments)
 
-                print(f"\033[1;36m Tool call detected: {function_name} with arguments {function_args} \033[0m")
 
-                if function_name in function_list :
+
+                print(f"\033[1;36m Tool call detected: {function_name} with arguments {function_args} \033[0m")
+                if function_name in function_list:
                     function_response = function_list[function_name](**function_args)
 
+                    # sérialisation propre
+                    if isinstance(function_response, str):
+                        result_content = function_response
+                    else:
+                        result_content = json.dumps(function_response)
+
                     self.conversation_history.append({
-                        "role" : "tool",
-                        "name" : function_name,
-                        "content" : function_response,
-                        "tool_call_id" : tool_call.id
-                    })
+                        "role": "tool",
+                        "name": function_name,
+                        "content": result_content,
+                        "tool_call_id": tool_call.id
+    })
 
 
         chat_response = self.client.chat.complete(
